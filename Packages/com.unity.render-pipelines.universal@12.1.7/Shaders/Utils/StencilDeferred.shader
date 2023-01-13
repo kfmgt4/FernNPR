@@ -12,6 +12,10 @@ Shader "Hidden/Universal Render Pipeline/StencilDeferred"
         _SimpleLitPunctualStencilRef ("SimpleLitPunctualStencilWriteMask", Int) = 0
         _SimpleLitPunctualStencilReadMask ("SimpleLitPunctualStencilReadMask", Int) = 0
         _SimpleLitPunctualStencilWriteMask ("SimpleLitPunctualStencilWriteMask", Int) = 0
+        
+        _NPRLitPunctualStencilRef ("NPRLitPunctualStencilWriteMask", Int) = 0
+        _NPRLitPunctualStencilReadMask ("NPRLitPunctualStencilReadMask", Int) = 0
+        _NPRLitPunctualStencilWriteMask ("NPRLitPunctualStencilWriteMask", Int) = 0
 
         _LitDirStencilRef ("LitDirStencilRef", Int) = 0
         _LitDirStencilReadMask ("LitDirStencilReadMask", Int) = 0
@@ -333,6 +337,170 @@ Shader "Hidden/Universal Render Pipeline/StencilDeferred"
         return half4(color, alpha);
     }
 
+    half4 NPRDeferredShading(Varyings input) : SV_Target
+    {
+        UNITY_SETUP_INSTANCE_ID(input);
+        UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(input);
+
+        float2 screen_uv = (input.screenUV.xy / input.screenUV.z);
+        #if _RENDER_PASS_ENABLED
+        float d        = LOAD_FRAMEBUFFER_INPUT(GBUFFER3, input.positionCS.xy).x;
+        half4 gbuffer0 = LOAD_FRAMEBUFFER_INPUT(GBUFFER0, input.positionCS.xy);
+        half4 gbuffer1 = LOAD_FRAMEBUFFER_INPUT(GBUFFER1, input.positionCS.xy);
+        half4 gbuffer2 = LOAD_FRAMEBUFFER_INPUT(GBUFFER2, input.positionCS.xy);
+        #else
+        // Using SAMPLE_TEXTURE2D is faster than using LOAD_TEXTURE2D on iOS platforms (5% faster shader).
+        // Possible reason: HLSLcc upcasts Load() operation to float, which doesn't happen for Sample()?
+        float d        = SAMPLE_TEXTURE2D_X_LOD(_CameraDepthTexture, my_point_clamp_sampler, screen_uv, 0).x; // raw depth value has UNITY_REVERSED_Z applied on most platforms.
+        half4 gbuffer0 = SAMPLE_TEXTURE2D_X_LOD(_GBuffer0, my_point_clamp_sampler, screen_uv, 0);
+        half4 gbuffer1 = SAMPLE_TEXTURE2D_X_LOD(_GBuffer1, my_point_clamp_sampler, screen_uv, 0);
+        half4 gbuffer2 = SAMPLE_TEXTURE2D_X_LOD(_GBuffer2, my_point_clamp_sampler, screen_uv, 0);
+        #endif
+        #if defined(_DEFERRED_MIXED_LIGHTING)
+        half4 shadowMask = SAMPLE_TEXTURE2D_X_LOD(MERGE_NAME(_, GBUFFER_SHADOWMASK), my_point_clamp_sampler, screen_uv, 0);
+        #else
+        half4 shadowMask = 1.0;
+        #endif
+
+        #ifdef _LIGHT_LAYERS
+        float4 renderingLayers = SAMPLE_TEXTURE2D_X_LOD(MERGE_NAME(_, GBUFFER_LIGHT_LAYERS), my_point_clamp_sampler, screen_uv, 0);
+        uint meshRenderingLayers = uint(renderingLayers.r * 255.5);
+        #else
+        uint meshRenderingLayers = DEFAULT_LIGHT_LAYERS;
+        #endif
+
+        half surfaceDataOcclusion = gbuffer1.a;
+        uint materialFlags = UnpackMaterialFlags(gbuffer0.a);
+
+        half3 color = 0.0.xxx;
+        half alpha = 1.0;
+
+        #if defined(_DEFERRED_MIXED_LIGHTING)
+        // If both lights and geometry are static, then no realtime lighting to perform for this combination.
+        [branch] if ((_LightFlags & materialFlags) == kMaterialFlagSubtractiveMixedLighting)
+            return half4(color, alpha); // Cannot discard because stencil must be updated.
+        #endif
+
+        #if defined(USING_STEREO_MATRICES)
+        int eyeIndex = unity_StereoEyeIndex;
+        #else
+        int eyeIndex = 0;
+        #endif
+        float4 posWS = mul(_ScreenToWorld[eyeIndex], float4(input.positionCS.xy, d, 1.0));
+        posWS.xyz *= rcp(posWS.w);
+
+        Light unityLight = GetStencilLight(posWS.xyz, screen_uv, shadowMask, materialFlags);
+
+        [branch] if (!IsMatchingLightLayer(unityLight.layerMask, meshRenderingLayers))
+            return half4(color, alpha); // Cannot discard because stencil must be updated.
+
+        #if defined(_SCREEN_SPACE_OCCLUSION) && !defined(_SURFACE_TYPE_TRANSPARENT)
+            AmbientOcclusionFactor aoFactor = GetScreenSpaceAmbientOcclusion(screen_uv);
+            unityLight.color *= aoFactor.directAmbientOcclusion;
+            #if defined(_DIRECTIONAL) && defined(_DEFERRED_FIRST_LIGHT)
+            // What we want is really to apply the mininum occlusion value between the baked occlusion from surfaceDataOcclusion and real-time occlusion from SSAO.
+            // But we already applied the baked occlusion during gbuffer pass, so we have to cancel it out here.
+            // We must also avoid divide-by-0 that the reciprocal can generate.
+            half occlusion = aoFactor.indirectAmbientOcclusion < surfaceDataOcclusion ? aoFactor.indirectAmbientOcclusion * rcp(surfaceDataOcclusion) : 1.0;
+            alpha = occlusion;
+            #endif
+        #endif
+
+        InputData inputData = InputDataFromGbufferAndWorldPosition(gbuffer2, posWS.xyz);
+
+        #if SHADER_API_MOBILE || SHADER_API_SWITCH
+        // Specular highlights are still silenced by setting specular to 0.0 during gbuffer pass and GPU timing is still reduced.
+        bool materialSpecularHighlightsOff = false;
+        #else
+        bool materialSpecularHighlightsOff = (materialFlags & kMaterialFlagSpecularHighlightsOff);
+        #endif
+        BRDFData brdfData = BRDFDataFromGbuffer(gbuffer0, gbuffer1, gbuffer2);
+        color = LightingPhysicallyBased_NPR(brdfData, unityLight, inputData.normalWS, inputData.viewDirectionWS, materialSpecularHighlightsOff);
+        return half4(color, alpha);
+    }
+
+    half4 NPRDeferredShading_Test(Varyings input) : SV_Target
+    {
+        UNITY_SETUP_INSTANCE_ID(input);
+        UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(input);
+
+        float2 screen_uv = (input.screenUV.xy / input.screenUV.z);
+        #if _RENDER_PASS_ENABLED
+        float d        = LOAD_FRAMEBUFFER_INPUT(GBUFFER3, input.positionCS.xy).x;
+        half4 gbuffer0 = LOAD_FRAMEBUFFER_INPUT(GBUFFER0, input.positionCS.xy);
+        half4 gbuffer1 = LOAD_FRAMEBUFFER_INPUT(GBUFFER1, input.positionCS.xy);
+        half4 gbuffer2 = LOAD_FRAMEBUFFER_INPUT(GBUFFER2, input.positionCS.xy);
+        #else
+        // Using SAMPLE_TEXTURE2D is faster than using LOAD_TEXTURE2D on iOS platforms (5% faster shader).
+        // Possible reason: HLSLcc upcasts Load() operation to float, which doesn't happen for Sample()?
+        float d        = SAMPLE_TEXTURE2D_X_LOD(_CameraDepthTexture, my_point_clamp_sampler, screen_uv, 0).x; // raw depth value has UNITY_REVERSED_Z applied on most platforms.
+        half4 gbuffer0 = SAMPLE_TEXTURE2D_X_LOD(_GBuffer0, my_point_clamp_sampler, screen_uv, 0);
+        half4 gbuffer1 = SAMPLE_TEXTURE2D_X_LOD(_GBuffer1, my_point_clamp_sampler, screen_uv, 0);
+        half4 gbuffer2 = SAMPLE_TEXTURE2D_X_LOD(_GBuffer2, my_point_clamp_sampler, screen_uv, 0);
+        #endif
+        #if defined(_DEFERRED_MIXED_LIGHTING)
+        half4 shadowMask = SAMPLE_TEXTURE2D_X_LOD(MERGE_NAME(_, GBUFFER_SHADOWMASK), my_point_clamp_sampler, screen_uv, 0);
+        #else
+        half4 shadowMask = 1.0;
+        #endif
+
+        #ifdef _LIGHT_LAYERS
+        float4 renderingLayers = SAMPLE_TEXTURE2D_X_LOD(MERGE_NAME(_, GBUFFER_LIGHT_LAYERS), my_point_clamp_sampler, screen_uv, 0);
+        uint meshRenderingLayers = uint(renderingLayers.r * 255.5);
+        #else
+        uint meshRenderingLayers = DEFAULT_LIGHT_LAYERS;
+        #endif
+
+        half surfaceDataOcclusion = gbuffer1.a;
+        uint materialFlags = UnpackMaterialFlags(gbuffer0.a);
+
+        half3 color = 0.0.xxx;
+        half alpha = 1.0;
+
+        #if defined(_DEFERRED_MIXED_LIGHTING)
+        // If both lights and geometry are static, then no realtime lighting to perform for this combination.
+        [branch] if ((_LightFlags & materialFlags) == kMaterialFlagSubtractiveMixedLighting)
+            return half4(color, alpha); // Cannot discard because stencil must be updated.
+        #endif
+
+        #if defined(USING_STEREO_MATRICES)
+        int eyeIndex = unity_StereoEyeIndex;
+        #else
+        int eyeIndex = 0;
+        #endif
+        float4 posWS = mul(_ScreenToWorld[eyeIndex], float4(input.positionCS.xy, d, 1.0));
+        posWS.xyz *= rcp(posWS.w);
+
+        Light unityLight = GetStencilLight(posWS.xyz, screen_uv, shadowMask, materialFlags);
+
+        [branch] if (!IsMatchingLightLayer(unityLight.layerMask, meshRenderingLayers))
+            return half4(color, alpha); // Cannot discard because stencil must be updated.
+
+        #if defined(_SCREEN_SPACE_OCCLUSION) && !defined(_SURFACE_TYPE_TRANSPARENT)
+            AmbientOcclusionFactor aoFactor = GetScreenSpaceAmbientOcclusion(screen_uv);
+            unityLight.color *= aoFactor.directAmbientOcclusion;
+            #if defined(_DIRECTIONAL) && defined(_DEFERRED_FIRST_LIGHT)
+            // What we want is really to apply the mininum occlusion value between the baked occlusion from surfaceDataOcclusion and real-time occlusion from SSAO.
+            // But we already applied the baked occlusion during gbuffer pass, so we have to cancel it out here.
+            // We must also avoid divide-by-0 that the reciprocal can generate.
+            half occlusion = aoFactor.indirectAmbientOcclusion < surfaceDataOcclusion ? aoFactor.indirectAmbientOcclusion * rcp(surfaceDataOcclusion) : 1.0;
+            alpha = occlusion;
+            #endif
+        #endif
+
+        InputData inputData = InputDataFromGbufferAndWorldPosition(gbuffer2, posWS.xyz);
+
+        #if SHADER_API_MOBILE || SHADER_API_SWITCH
+        // Specular highlights are still silenced by setting specular to 0.0 during gbuffer pass and GPU timing is still reduced.
+        bool materialSpecularHighlightsOff = false;
+        #else
+        bool materialSpecularHighlightsOff = (materialFlags & kMaterialFlagSpecularHighlightsOff);
+        #endif
+        BRDFData brdfData = BRDFDataFromGbuffer(gbuffer0, gbuffer1, gbuffer2);
+        color = LightingPhysicallyBased_NPR(brdfData, unityLight, inputData.normalWS, inputData.viewDirectionWS, materialSpecularHighlightsOff);
+        return half4(color, alpha);
+    }
+
     half4 FragFog(Varyings input) : SV_Target
     {
         #if _RENDER_PASS_ENABLED
@@ -494,8 +662,55 @@ Shader "Hidden/Universal Render Pipeline/StencilDeferred"
 
             ENDHLSL
         }
+        
+        // 3 - Deferred Punctual Light (NPRLit)
+        Pass
+        {
+            Name "Deferred Punctual Light (NPRLit)"
 
-        // 3 - Deferred Directional Light (Lit)
+            ZTest GEqual
+            ZWrite Off
+            ZClip false
+            Cull Front
+            Blend One One, Zero One
+            BlendOp Add, Add
+
+            Stencil {
+                Ref [_NPRLitPunctualStencilRef]
+                ReadMask [_NPRLitPunctualStencilReadMask]
+                WriteMask [_NPRLitPunctualStencilWriteMask]
+                Comp Equal
+                Pass Zero
+                Fail Keep
+                ZFail Keep
+            }
+
+            HLSLPROGRAM
+            #pragma exclude_renderers gles gles3 glcore
+            #pragma target 4.5
+
+            #pragma multi_compile_fragment _DEFERRED_STENCIL
+            #pragma multi_compile _POINT _SPOT
+            #pragma multi_compile_fragment _LIT
+            #pragma multi_compile_fragment _ _ADDITIONAL_LIGHT_SHADOWS
+            #pragma multi_compile_fragment _ _SHADOWS_SOFT
+            #pragma multi_compile_fragment _ LIGHTMAP_SHADOW_MIXING
+            #pragma multi_compile_fragment _ SHADOWS_SHADOWMASK
+            #pragma multi_compile_fragment _ _GBUFFER_NORMALS_OCT
+            #pragma multi_compile_fragment _ _DEFERRED_MIXED_LIGHTING
+            #pragma multi_compile_fragment _ _SCREEN_SPACE_OCCLUSION
+            #pragma multi_compile_fragment _ _LIGHT_LAYERS
+            #pragma multi_compile_fragment _ _RENDER_PASS_ENABLED
+            #pragma multi_compile_fragment _ _LIGHT_COOKIES
+
+            #pragma vertex Vertex
+            #pragma fragment NPRDeferredShading
+            //#pragma enable_d3d11_debug_symbols
+
+            ENDHLSL
+        }
+
+        // 4 - Deferred Directional Light (Lit)
         Pass
         {
             Name "Deferred Directional Light (Lit)"
@@ -544,7 +759,7 @@ Shader "Hidden/Universal Render Pipeline/StencilDeferred"
             ENDHLSL
         }
 
-        // 4 - Deferred Directional Light (SimpleLit)
+        // 5 - Deferred Directional Light (SimpleLit)
         Pass
         {
             Name "Deferred Directional Light (SimpleLit)"
@@ -592,8 +807,8 @@ Shader "Hidden/Universal Render Pipeline/StencilDeferred"
 
             ENDHLSL
         }
-        
-        // 5 - Deferred Directional Light (NPRLit)
+     
+        // 6 - Deferred Directional Light (NPRLit)
         Pass
         {
             Name "Deferred Directional Light (NPRLit)"
@@ -620,7 +835,7 @@ Shader "Hidden/Universal Render Pipeline/StencilDeferred"
 
             #pragma multi_compile_fragment _DEFERRED_STENCIL
             #pragma multi_compile _DIRECTIONAL
-            #pragma multi_compile_fragment _SIMPLELIT
+            #pragma multi_compile_fragment _LIT
             #pragma multi_compile_fragment _ _MAIN_LIGHT_SHADOWS _MAIN_LIGHT_SHADOWS_CASCADE _MAIN_LIGHT_SHADOWS_SCREEN
             #pragma multi_compile_fragment _ _DEFERRED_MAIN_LIGHT
             #pragma multi_compile_fragment _ _DEFERRED_FIRST_LIGHT
@@ -636,13 +851,13 @@ Shader "Hidden/Universal Render Pipeline/StencilDeferred"
             #pragma multi_compile_fragment _ _LIGHT_COOKIES
 
             #pragma vertex Vertex
-            #pragma fragment DeferredShading
+            #pragma fragment NPRDeferredShading
             //#pragma enable_d3d11_debug_symbols
 
             ENDHLSL
         }
 
-        // 6 - Legacy fog
+        // 7 - Legacy fog
         Pass
         {
             Name "Fog"
@@ -668,7 +883,7 @@ Shader "Hidden/Universal Render Pipeline/StencilDeferred"
             ENDHLSL
         }
 
-        // 7 - Clear stencil partial
+        // 8 - Clear stencil partial
         // This pass clears stencil between camera stacks rendering.
         // This is because deferred renderer encodes material properties in the 4 highest bits of the stencil buffer,
         // but we don't want to keep this information between camera stacks.
@@ -702,7 +917,7 @@ Shader "Hidden/Universal Render Pipeline/StencilDeferred"
             ENDHLSL
         }
 
-        // 8 - SSAO Only
+        // 9 - SSAO Only
         // This pass only runs when there is no fullscreen deferred light rendered (no directional light). It will adjust indirect/baked lighting with realtime occlusion
         // by rendering just before deferred shading pass.
         // This pass is also completely discarded from vertex shader when SSAO renderer feature is not enabled.

@@ -221,6 +221,53 @@ Varyings LitGBufferPassVertex(Attributes input)
     return output;
 }
 
+half3 NPRGDiffuseLightingBuffer(BRDFData brdfData, half2 uv, LightingData lightingData, half radiance)
+{
+    half3 diffuse = 0;
+
+    #if _CELLSHADING
+    diffuse = CellShadingDiffuse(radiance, _CELLThreshold, _CELLSmoothing, _HighColor.rgb, _DarkColor.rgb);
+    #elif _LAMBERTIAN
+    diffuse = lerp(_DarkColor.rgb, _HighColor.rgb, radiance);
+    #elif _RAMPSHADING
+    diffuse = RampShadingDiffuse(radiance, _RampMapVOffset, _RampMapUOffset, TEXTURE2D_ARGS(_DiffuseRampMap, sampler_DiffuseRampMap));
+    #elif _CELLBANDSHADING
+    diffuse = CellBandsShadingDiffuse(radiance, _CELLThreshold, _CellBandSoftness, _CellBands,  _HighColor.rgb, _DarkColor.rgb);
+    #elif _SDFFACE
+    diffuse = SDFFaceDiffuse(uv, lightingData, _SDFShadingSoftness, _HighColor.rgb, _DarkColor.rgb, TEXTURECUBE_ARGS(_SDFFaceTex, sampler_SDFFaceTex));
+    #endif
+    diffuse *= brdfData.diffuse;
+    return diffuse;
+}
+
+LightingData InitializeLightingDataGBuffer(Light mainLight, Varyings input, half3 normalWS, half3 viewDirectionWS, NPRAddInputData addInputData)
+{
+    LightingData lightData;
+    lightData.lightColor = mainLight.color;
+    #if EYE
+    lightData.NdotL = dot(addInputData.irisNormalWS, mainLight.direction.xyz);
+    #else
+    lightData.NdotL = dot(normalWS, mainLight.direction.xyz);
+    #endif
+    lightData.NdotLClamp = saturate(lightData.NdotL);
+    lightData.HalfLambert = lightData.NdotL * 0.5 + 0.5;
+    half3 halfDir = SafeNormalize(mainLight.direction + viewDirectionWS);
+    lightData.LdotHClamp = saturate(dot(mainLight.direction.xyz, halfDir.xyz));
+    lightData.NdotHClamp = saturate(dot(normalWS.xyz, halfDir.xyz));
+    lightData.NdotVClamp = saturate(dot(normalWS.xyz, viewDirectionWS.xyz));
+    lightData.HalfDir = halfDir;
+    lightData.lightDir = mainLight.direction;
+    #if defined(_RECEIVE_SHADOWS_OFF)
+    lightData.ShadowAttenuation = 1;
+    #elif _DEPTHSHADOW
+    lightData.ShadowAttenuation = DepthShadow(_DepthShadowOffset, _DepthOffsetShadowReverseX, _DepthShadowThresoldOffset, _DepthShadowSoftness, input.positionCS.xy, mainLight.direction, addInputData);
+    #else
+    lightData.ShadowAttenuation = mainLight.shadowAttenuation * mainLight.distanceAttenuation;
+    #endif
+
+    return lightData;
+}
+
 // Used in Standard (Physically Based) shader
 FragmentOutput LitGBufferPassFragment(Varyings input)
 {
@@ -254,8 +301,12 @@ FragmentOutput LitGBufferPassFragment(Varyings input)
     MixRealtimeAndBakedGI(mainLight, inputData.normalWS, inputData.bakedGI, inputData.shadowMask);
     
     half3 indirectLighting = NPRIndirectLighting(brdfData, inputData, input, surfaceData.occlusion);
+    LightingData lightingData = InitializeLightingDataGBuffer(mainLight, input, inputData.normalWS, inputData.viewDirectionWS, addInputData);
+    half radiance = LightingRadiance(lightingData, _UseHalfLambert, surfaceData.occlusion, _UseRadianceOcclusion);
 
-    return BRDFDataToGbuffer(brdfData, inputData, surfaceData.smoothness, surfaceData.emission + indirectLighting, surfaceData.occlusion);
+    half3 diffuse = NPRGDiffuseLightingBuffer(brdfData, input.uv, lightingData, radiance);
+
+    return BRDFDataToGbuffer(brdfData, diffuse, inputData, surfaceData.smoothness, surfaceData.emission + indirectLighting, surfaceData.occlusion);
 }
 
 #endif
